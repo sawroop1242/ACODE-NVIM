@@ -1,83 +1,286 @@
-name: Build Acode APK with Patches
+name: Build Acode APK with Neovim Plugin Integration
 
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
+
+env:
+  NODE_VERSION: '22'
+  JAVA_VERSION: '17'
+  ACODE_REPO: 'https://github.com/deadlyjack/Acode.git'
 
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      # Step 1: Check out current repository (contains patches/)
+      # ============================================================================
+      # Step 1: Checkout Current Repository (contains patches/ and plugin source)
+      # ============================================================================
       - name: Checkout Current Repository
         uses: actions/checkout@v4
         with:
           path: main-repo
+          fetch-depth: 0
 
-      # Step 2: Clone the official Acode repository
+      # ============================================================================
+      # Step 2: Clone the Official Acode Repository
+      # ============================================================================
       - name: Clone Acode Repository
         run: |
-          git clone https://github.com/deadlyjack/Acode.git acode
+          git clone --depth 1 ${{ env.ACODE_REPO }} acode
+          cd acode
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
 
-      # Step 3: Set up Java JDK 17
+      # ============================================================================
+      # Step 3: Validate Patches Exist
+      # ============================================================================
+      - name: Validate Patches Directory
+        run: |
+          if [ ! -d "main-repo/patches" ]; then
+            echo "::error::Patches directory not found at main-repo/patches"
+            exit 1
+          fi
+          
+          PATCH_COUNT=$(find main-repo/patches -name "*.patch" -type f | wc -l)
+          echo "Found $PATCH_COUNT patch file(s) to apply"
+          echo "PATCH_COUNT=$PATCH_COUNT" >> $GITHUB_ENV
+          
+          if [ "$PATCH_COUNT" -eq 0 ]; then
+            echo "::warning::No .patch files found in main-repo/patches"
+          fi
+
+      # ============================================================================
+      # Step 4: Apply Patch Files from main-repo onto Acode
+      # ============================================================================
+      - name: Apply Patch Files
+        run: |
+          cd acode
+          APPLY_SUCCESS=0
+          APPLY_FAILED=0
+          APPLY_SKIPPED=0
+          
+          for patch in ../main-repo/patches/*.patch; do
+            [ -e "$patch" ] || continue
+            
+            PATCH_NAME=$(basename "$patch")
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Applying patch: $PATCH_NAME"
+            
+            if git apply --check "$patch" 2>/dev/null; then
+              if git apply --forward "$patch"; then
+                echo "✓ Successfully applied: $PATCH_NAME"
+                ((APPLY_SUCCESS++))
+              else
+                echo "⚠ Skipped (already applied): $PATCH_NAME"
+                ((APPLY_SKIPPED++))
+              fi
+            else
+              echo "✗ Failed to apply: $PATCH_NAME"
+              echo "Attempting with --3way merge..."
+              if git apply --3way "$patch" 2>/dev/null; then
+                echo "✓ Applied with 3-way merge: $PATCH_NAME"
+                ((APPLY_SUCCESS++))
+              else
+                echo "::error::Failed to apply patch: $PATCH_NAME"
+                ((APPLY_FAILED++))
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Patch Application Summary:"
+          echo "  ✓ Success: $APPLY_SUCCESS"
+          echo "  ⚠ Skipped: $APPLY_SKIPPED"
+          echo "  ✗ Failed: $APPLY_FAILED"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          
+          if [ "$APPLY_FAILED" -gt 0 ]; then
+            echo "::error::$APPLY_FAILED patch(es) failed to apply"
+            exit 1
+          fi
+
+      # ============================================================================
+      # Step 5: Copy Neovim Plugin Source Files
+      # ============================================================================
+      - name: Copy Neovim Plugin to Acode
+        run: |
+          if [ -d "main-repo/plugin" ]; then
+            echo "Copying Neovim Headless Bridge plugin files..."
+            
+            # Create plugin directory in Acode's plugins folder
+            mkdir -p acode/src/plugins/nvim-bridge
+            
+            # Copy all plugin files
+            cp -r main-repo/plugin/* acode/src/plugins/nvim-bridge/
+            
+            echo "Plugin files copied successfully"
+            ls -la acode/src/plugins/nvim-bridge/
+          else
+            echo "::warning::Plugin source directory not found at main-repo/plugin"
+            echo "Continuing without plugin installation..."
+          fi
+
+      # ============================================================================
+      # Step 6: Set Up Java JDK
+      # ============================================================================
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
 
-      # Step 4: Set up Android SDK
+      # ============================================================================
+      # Step 7: Set Up Android SDK
+      # ============================================================================
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          log-verbose: false
+          cmdline-tools-version: latest
 
-      # Step 5: Set up Node.js environment
+      # ============================================================================
+      # Step 8: Set Up Node.js Environment
+      # ============================================================================
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
           cache-dependency-path: acode/package-lock.json
 
-      # Step 6: Apply patch files from main-repo onto Acode
-      - name: Apply Patch Files
-        run: |
-          cd acode
-          if [ -d "../main-repo/patches" ]; then
-            for patch in ../main-repo/patches/*.patch; do
-              [ -e "$patch" ] || continue
-              echo "Applying patch: $patch..."
-              git apply --forward "$patch" || echo "Skipped $patch (already applied or conflict)"
-            done
-          else
-            echo "No patches folder found at main-repo/patches"
-          fi
-
-      # Step 7: Install Dependencies
+      # ============================================================================
+      # Step 9: Install Dependencies
+      # ============================================================================
       - name: Install Dependencies
         working-directory: acode
-        run: npm ci || npm install
+        run: |
+          echo "Installing npm dependencies..."
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          
+          echo "Installing Cordova globally..."
+          npm install -g cordova@latest
 
-      # Step 8: Initialize Cordova Android Platform (moved before build script)
+      # ============================================================================
+      # Step 10: Initialize Cordova Android Platform
+      # ============================================================================
       - name: Add Cordova Android Platform
         working-directory: acode
-        run: npx cordova platform add android --nosave || true
+        run: |
+          echo "Adding Android platform..."
+          npx cordova platform add android@latest --save
+          
+          echo "Verifying Android platform installation..."
+          npx cordova platform ls
 
-      # Step 9: Build Acode Web Assets & Trigger Build Script
+      # ============================================================================
+      # Step 11: Configure Android Build Settings
+      # ============================================================================
+      - name: Configure Android Build
+        working-directory: acode
+        run: |
+          # Accept Android licenses
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          
+          # Install required Android SDK components
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          
+          # Set ANDROID_HOME if not set
+          export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
+          export ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+
+      # ============================================================================
+      # Step 12: Build Acode Web Assets
+      # ============================================================================
       - name: Build Web Assets
         working-directory: acode
-        run: npm run build
+        run: |
+          echo "Building web assets..."
+          npm run build
+          
+          echo "Verifying build output..."
+          ls -la www/
 
-      # Step 10: Compile Android APK via Cordova
-      - name: Build Android APK
+      # ============================================================================
+      # Step 13: Compile Android APK via Cordova
+      # ============================================================================
+      - name: Build Android APK (Debug)
         working-directory: acode
-        run: npx cordova build android --release --device
+        run: |
+          echo "Starting Android debug build..."
+          npx cordova build android --debug --device
+          
+          echo "Build completed. Searching for APK files..."
+          find platforms/android/app/build/outputs/apk -name "*.apk" -type f
 
-      # Step 11: Upload Generated APK Artifact
-      - name: Upload APK Artifact
+      # ============================================================================
+      # Step 14: Verify and Collect APK Files
+      # ============================================================================
+      - name: Collect APK Files
+        id: collect_apk
+        run: |
+          mkdir -p apk-output
+          
+          APK_FILES=$(find acode/platforms/android/app/build/outputs/apk -name "*.apk" -type f)
+          
+          if [ -z "$APK_FILES" ]; then
+            echo "::error::No APK files found after build"
+            exit 1
+          fi
+          
+          for apk in $APK_FILES; do
+            APK_NAME=$(basename "$apk")
+            echo "Copying APK: $APK_NAME"
+            cp "$apk" apk-output/
+            
+            # Calculate SHA256 checksum
+            sha256sum "$apk" | awk '{print $1}' > "apk-output/${APK_NAME}.sha256"
+          done
+          
+          echo "APK files collected:"
+          ls -lh apk-output/
+
+      # ============================================================================
+      # Step 15: Upload APK Artifacts
+      # ============================================================================
+      - name: Upload APK Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: acode-apk
-          path: acode/platforms/android/app/build/outputs/apk/**/*.apk
+          name: acode-nvim-apk
+          path: |
+            apk-output/*.apk
+            apk-output/*.sha256
           if-no-files-found: error
+          retention-days: 30
+
+      # ============================================================================
+      # Step 16: Build Summary
+      # ============================================================================
+      - name: Build Summary
+        run: |
+          echo "## 🎉 Build Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### APK Files" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh apk-output/*.apk 2>/dev/null || echo "No APK files found" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### SHA256 Checksums" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat apk-output/*.sha256 2>/dev/null || echo "No checksums available" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
