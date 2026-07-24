@@ -41,6 +41,9 @@ jobs:
           cache-dependency-path: acode/package-lock.json
 
       # Step 6: Apply patch files from main-repo onto Acode
+      
+
+      # Step 6: Apply patch files from main-repo onto Acode
       - name: Apply Patch Files
         run: |
           cd acode
@@ -48,7 +51,8 @@ jobs:
             for patch in ../main-repo/patches/*.patch; do
               [ -e "$patch" ] || continue
               echo "Applying patch: $patch..."
-              git apply "$patch"
+              # --forward ignores patches that are already applied
+              git apply --forward "$patch" || echo "Skipped $patch (already applied or conflict)"
             done
           else
             echo "No patches folder found at main-repo/patches"
