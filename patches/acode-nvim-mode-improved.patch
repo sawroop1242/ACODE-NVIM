@@ -1,0 +1,1014 @@
+diff --git a/package.json b/package.json
+index 39fc2f6..8f6a5a4 100644
+--- a/package.json
++++ b/package.json
+@@ -115,6 +115,7 @@
+   },
+   "dependencies": {
+     "@codemirror/autocomplete": "^6.20.3",
++    "@msgpack/msgpack": "^3.0.0",
+     "@codemirror/commands": "^6.10.3",
+     "@codemirror/lang-angular": "^0.1.4",
+     "@codemirror/lang-cpp": "^6.0.3",
+diff --git a/src/cm/lsp/serverRegistry.ts b/src/cm/lsp/serverRegistry.ts
+index 8175c2f..6098bb5 100644
+--- a/src/cm/lsp/serverRegistry.ts
++++ b/src/cm/lsp/serverRegistry.ts
+@@ -167,7 +167,7 @@ interface RawLauncherConfig {
+ 
+ export type RawServerDefinition = LspServerManifest;
+ 
+-function sanitizeDefinition(
++export function sanitizeDefinition(
+ 	definition: RawServerDefinition,
+ ): LspServerDefinition {
+ 	if (!definition || typeof definition !== "object") {
+diff --git a/src/cm/lsp/transport.ts b/src/cm/lsp/transport.ts
+index d760893..94580b1 100644
+--- a/src/cm/lsp/transport.ts
++++ b/src/cm/lsp/transport.ts
+@@ -19,10 +19,17 @@ const RECONNECT_MAX_ATTEMPTS = 5;
+ 
+ type MessageListener = (data: string) => void;
+ 
++type RawMessageListener = (data: Uint8Array) => void;
++
+ interface TransportInterface extends Transport {
+ 	send(message: string): void;
+ 	subscribe(handler: MessageListener): void;
+ 	unsubscribe(handler: MessageListener): void;
++	// Raw byte path for genuinely binary protocols (e.g. msgpack-rpc), as
++	// opposed to `binary`, which is UTF-8 text carried in binary WS frames.
++	sendRaw?(bytes: Uint8Array): void;
++	subscribeRaw?(handler: RawMessageListener): void;
++	unsubscribeRaw?(handler: RawMessageListener): void;
+ }
+ 
+ function createWebSocketTransport(
+@@ -78,7 +85,7 @@ function createWebSocketTransport(
+ 			// pylsp's websocket endpoint does not require subprotocol negotiation.
+ 			// Avoid passing protocols to keep the handshake simple.
+ 			const ws = new WebSocket(wsUrl);
+-			if (binaryMode) {
++			if (binaryMode || rawMode) {
+ 				ws.binaryType = "arraybuffer";
+ 			}
+ 			return ws;
+@@ -90,7 +97,15 @@ function createWebSocketTransport(
+ 		}
+ 	}
+ 
++	const rawListeners = new Set<RawMessageListener>();
++	const rawMode = !!options.raw;
++
+ 	function handleMessage(event: MessageEvent): void {
++		if (rawMode && event.data instanceof ArrayBuffer) {
++			dispatchRawToListeners(new Uint8Array(event.data));
++			return;
++		}
++
+ 		let data: string;
+ 		if (typeof event.data === "string") {
+ 			data = event.data;
+@@ -118,6 +133,16 @@ function createWebSocketTransport(
+ 		dispatchToListeners(data);
+ 	}
+ 
++	function dispatchRawToListeners(bytes: Uint8Array): void {
++		rawListeners.forEach((listener) => {
++			try {
++				listener(bytes);
++			} catch (error) {
++				console.error("LSP transport raw listener failed", error);
++			}
++		});
++	}
++
+ 	function dispatchToListeners(data: string): void {
+ 		// Debugging aid while stabilising websocket transport
+ 		if (context?.debugWebSocket) {
+@@ -321,6 +346,18 @@ function createWebSocketTransport(
+ 		unsubscribe(handler: MessageListener): void {
+ 			listeners.delete(handler);
+ 		},
++		sendRaw(bytes: Uint8Array): void {
++			if (!connected || !socket || socket.readyState !== WebSocket.OPEN) {
++				throw new Error("WebSocket transport is not open");
++			}
++			socket.send(bytes);
++		},
++		subscribeRaw(handler: RawMessageListener): void {
++			rawListeners.add(handler);
++		},
++		unsubscribeRaw(handler: RawMessageListener): void {
++			rawListeners.delete(handler);
++		},
+ 	};
+ 
+ 	const dispose = (): void => {
+diff --git a/src/cm/lsp/types.ts b/src/cm/lsp/types.ts
+index 1ea75b2..341cecf 100644
+--- a/src/cm/lsp/types.ts
++++ b/src/cm/lsp/types.ts
+@@ -47,6 +47,8 @@ type MaybePromise<T> = T | Promise<T>;
+ 
+ export interface WebSocketTransportOptions {
+ 	binary?: boolean;
++	/** True byte-safe framing (no UTF-8 round trip) for binary protocols like msgpack-rpc. */
++	raw?: boolean;
+ 	timeout?: number;
+ 	reconnect?: boolean;
+ 	maxReconnectAttempts?: number;
+diff --git a/src/cm/mainEditorExtensions.ts b/src/cm/mainEditorExtensions.ts
+index e445bf9..91ff4b1 100644
+--- a/src/cm/mainEditorExtensions.ts
++++ b/src/cm/mainEditorExtensions.ts
+@@ -13,6 +13,7 @@ interface MainEditorExtensionOptions {
+ 	quickToolsModifierInputExtension?: Extension;
+ 	searchExtension?: Extension;
+ 	readOnlyExtension?: Extension;
++	nvimModeExtension?: Extension;
+ 	optionExtensions?: Extension[];
+ }
+ 
+@@ -53,6 +54,7 @@ export function createMainEditorExtensions(
+ 	pushExtension(extensions, options.quickToolsModifierInputExtension);
+ 	pushExtension(extensions, options.searchExtension);
+ 	pushExtension(extensions, options.readOnlyExtension);
++	pushExtension(extensions, options.nvimModeExtension);
+ 
+ 	if (options.optionExtensions?.length) {
+ 		extensions.push(...options.optionExtensions);
+diff --git a/src/cm/nvim/msgpackRpc.ts b/src/cm/nvim/msgpackRpc.ts
+new file mode 100644
+index 0000000..daf4b77
+--- /dev/null
++++ b/src/cm/nvim/msgpackRpc.ts
+@@ -0,0 +1,88 @@
++import { decode, encode } from "@msgpack/msgpack";
++import { createTransport } from "../lsp/transport";
++import type { LspServerDefinition, TransportContext } from "../lsp/types";
++
++type NotifyHandler = (method: string, params: unknown[]) => void;
++
++interface RawTransportInterface {
++	sendRaw(bytes: Uint8Array): void;
++	subscribeRaw(handler: (data: Uint8Array) => void): void;
++	unsubscribeRaw(handler: (data: Uint8Array) => void): void;
++}
++
++export interface NvimRpcClient {
++	request(method: string, params: unknown[]): Promise<unknown>;
++	notify(method: string, params: unknown[]): void;
++	onNotification(handler: NotifyHandler): () => void;
++	dispose(): void;
++}
++
++/**
++ * msgpack-rpc, per the neovim/msgpack-rpc spec:
++ *   request:      [0, msgid, method, params]
++ *   response:     [1, msgid, error, result]
++ *   notification: [2, method, params]
++ */
++export async function connectNvimRpc(
++	server: LspServerDefinition,
++	context: TransportContext,
++): Promise<NvimRpcClient> {
++	const { transport, dispose, ready } = createTransport(server, context);
++	await ready;
++
++	const raw = transport as unknown as RawTransportInterface;
++	if (!raw.sendRaw || !raw.subscribeRaw) {
++		throw new Error(
++			"Transport was not created with { raw: true } — nvim's msgpack-rpc " +
++				"traffic requires byte-safe framing, not the UTF-8 `binary` mode.",
++		);
++	}
++
++	let nextMsgId = 0;
++	const pending = new Map<
++		number,
++		{ resolve: (v: unknown) => void; reject: (e: unknown) => void }
++	>();
++	const notifyHandlers = new Set<NotifyHandler>();
++
++	const onRaw = (bytes: Uint8Array) => {
++		const msg = decode(bytes) as unknown[];
++		const type = msg[0] as number;
++
++		if (type === 1) {
++			const [, msgid, error, result] = msg as [number, number, unknown, unknown];
++			const entry = pending.get(msgid);
++			if (!entry) return;
++			pending.delete(msgid);
++			if (error) entry.reject(error);
++			else entry.resolve(result);
++		} else if (type === 2) {
++			const [, method, params] = msg as [number, string, unknown[]];
++			notifyHandlers.forEach((handler) => handler(method, params));
++		}
++		// type === 0 (an incoming request from nvim, e.g. nvim_error_event)
++		// is intentionally unhandled here — add if/when a plugin needs it.
++	};
++	raw.subscribeRaw(onRaw);
++
++	return {
++		request(method, params) {
++			const msgid = nextMsgId++;
++			return new Promise((resolve, reject) => {
++				pending.set(msgid, { resolve, reject });
++				raw.sendRaw(encode([0, msgid, method, params]));
++			});
++		},
++		notify(method, params) {
++			raw.sendRaw(encode([2, method, params]));
++		},
++		onNotification(handler) {
++			notifyHandlers.add(handler);
++			return () => notifyHandlers.delete(handler);
++		},
++		dispose() {
++			raw.unsubscribeRaw(onRaw);
++			dispose();
++		},
++	};
++}
+diff --git a/src/cm/nvim/nvimKeyNotation.ts b/src/cm/nvim/nvimKeyNotation.ts
+new file mode 100644
+index 0000000..64117df
+--- /dev/null
++++ b/src/cm/nvim/nvimKeyNotation.ts
+@@ -0,0 +1,84 @@
++/*
++ * Maps browser KeyboardEvents to Neovim's <key> notation (:help key-notation)
++ * so any keybinding you have in init.lua — leader mappings, multi-key
++ * sequences, custom maps — reaches nvim_input() correctly, not just the
++ * small hardcoded set (Esc/Enter/Tab/arrows) the first draft of this
++ * plugin covered.
++ *
++ * Known limitation: this listens on `keydown`, which is reliable for
++ * hardware/Bluetooth keyboards and most soft-keyboard letter/number keys.
++ * Some Android IME features — predictive-text suggestion chips, swipe
++ * typing, autocorrect popups — deliver text via `compositionend`/
++ * `beforeinput` instead of clean `keydown` events with a proper `e.key`,
++ * and will NOT be forwarded correctly by this alone. That's a separate,
++ * real problem worth testing for early, not something solved here.
++ */
++
++const NAMED_KEYS: Record<string, string> = {
++	Escape: "Esc",
++	Enter: "CR",
++	Backspace: "BS",
++	Tab: "Tab",
++	Delete: "Del",
++	Insert: "Insert",
++	Home: "Home",
++	End: "End",
++	PageUp: "PageUp",
++	PageDown: "PageDown",
++	ArrowUp: "Up",
++	ArrowDown: "Down",
++	ArrowLeft: "Left",
++	ArrowRight: "Right",
++};
++
++for (let i = 1; i <= 24; i++) {
++	NAMED_KEYS[`F${i}`] = `F${i}`;
++}
++
++// Modifier-only keydowns and IME/composition artifacts — never forwarded.
++const IGNORED_KEYS = new Set([
++	"Shift",
++	"Control",
++	"Alt",
++	"Meta",
++	"CapsLock",
++	"OS",
++	"ContextMenu",
++	"Unidentified",
++	"Dead",
++	"Process",
++	"AltGraph",
++	"NumLock",
++	"ScrollLock",
++	"Pause",
++]);
++
++function modifierPrefix(e: KeyboardEvent, includeShift: boolean): string {
++	let mods = "";
++	if (e.ctrlKey) mods += "C-";
++	if (e.altKey) mods += "M-";
++	if (includeShift && e.shiftKey) mods += "S-";
++	if (e.metaKey) mods += "D-"; // Cmd, on the rare Bluetooth Mac-layout keyboard
++	return mods;
++}
++
++export function toNvimKey(e: KeyboardEvent): string | null {
++	if (IGNORED_KEYS.has(e.key)) return null;
++
++	const named = NAMED_KEYS[e.key];
++	if (named) {
++		const mods = modifierPrefix(e, true);
++		return `<${mods}${named}>`;
++	}
++
++	if (e.key.length === 1) {
++		// e.key already reflects Shift for printable characters (Shift+1 → "!"),
++		// so Shift never gets its own prefix here — only Ctrl/Alt/Meta do.
++		const mods = modifierPrefix(e, false);
++		// Literal '<' must be escaped or nvim reads it as a token start.
++		const literal = e.key === "<" ? "lt" : e.key;
++		return mods ? `<${mods}${literal}>` : e.key === "<" ? "<lt>" : e.key;
++	}
++
++	return null;
++}
+diff --git a/src/cm/nvim/nvimLsp.ts b/src/cm/nvim/nvimLsp.ts
+new file mode 100644
+index 0000000..f534545
+--- /dev/null
++++ b/src/cm/nvim/nvimLsp.ts
+@@ -0,0 +1,60 @@
++import { autocompletion, type CompletionSource } from "@codemirror/autocomplete";
++import { linter } from "@codemirror/lint";
++import { getActiveNvimPlugin } from "./nvimModePlugin";
++
++/*
++ * These read from whatever the active NvimModePlugin instance has already
++ * received over RPC (see nvimModePlugin.ts) — no separate connection, no
++ * separate LSP client. This is the piece that lets editorManager.js swap
++ * Acode's own LSP extensions for these when vim mode is on.
++ */
++
++export const nvimDiagnosticsExtension = linter((view) => {
++	return getActiveNvimPlugin()?.getDiagnostics() ?? [];
++});
++
++// LSP CompletionItemKind -> CodeMirror's completion `type` (drives the icon).
++const KIND_TO_CM_TYPE: Record<number, string> = {
++	2: "method",
++	3: "function",
++	5: "field",
++	6: "variable",
++	7: "class",
++	8: "interface",
++	9: "module",
++	10: "property",
++	13: "enum",
++	14: "keyword",
++	15: "text",
++	21: "constant",
++};
++
++const nvimCompletionSource: CompletionSource = async (context) => {
++	const plugin = getActiveNvimPlugin();
++	if (!plugin) return null;
++
++	const word = context.matchBefore(/[\w$]*/);
++	if (!context.explicit && (!word || word.from === word.to)) return null;
++
++	const items = await plugin.requestCompletion(context.pos);
++	if (!items.length) return null;
++
++	return {
++		from: word ? word.from : context.pos,
++		options: items.map((item) => ({
++			label: item.label,
++			apply: item.insertText ?? item.label,
++			detail: item.detail,
++			type: item.kind ? KIND_TO_CM_TYPE[item.kind] : undefined,
++		})),
++	};
++};
++
++export const nvimCompletionExtension = autocompletion({
++	override: [nvimCompletionSource],
++});
++
++export const nvimLspExtensions = [
++	nvimDiagnosticsExtension,
++	nvimCompletionExtension,
++];
+diff --git a/src/cm/nvim/nvimModePlugin.ts b/src/cm/nvim/nvimModePlugin.ts
+new file mode 100644
+index 0000000..b1f9caf
+--- /dev/null
++++ b/src/cm/nvim/nvimModePlugin.ts
+@@ -0,0 +1,333 @@
++import type { Diagnostic } from "@codemirror/lint";
++import { forceLinting } from "@codemirror/lint";
++import { Prec } from "@codemirror/state";
++import { type EditorView, ViewPlugin, keymap } from "@codemirror/view";
++import { connectNvimRpc, type NvimRpcClient } from "./msgpackRpc";
++import { toNvimKey } from "./nvimKeyNotation";
++import { nvimServerDefinition } from "./nvimServer";
++import { ensureServerRunning } from "../lsp/serverLauncher";
++
++/*
++ * Neovim is the source of truth for buffer text, cursor, mode, diagnostics,
++ * and completion — the same split vscode-neovim uses against VSCode's
++ * Monaco. CodeMirror never mutates text on its own here; every keystroke
++ * goes to nvim_input() first, and this plugin only ever paints what
++ * nvim_buf_lines_event says actually changed. Diagnostics and completion
++ * now come from whatever LSP client your own init.lua already configures
++ * (nvim-lspconfig + Pyright, etc.) — Acode's separate LSP client is not
++ * used for files opened in vim mode; see editorManager.js's
++ * configureLspForFile for where that swap happens.
++ */
++
++const modeLabels: Record<string, string> = {
++	n: "NORMAL",
++	i: "INSERT",
++	v: "VISUAL",
++	V: "V-LINE",
++	R: "REPLACE",
++};
++
++interface NvimDiagnostic {
++	lnum: number;
++	col: number;
++	end_lnum?: number;
++	end_col?: number;
++	message: string;
++	severity: number; // 1=Error, 2=Warn, 3=Info, 4=Hint — vim.diagnostic.severity
++	source?: string;
++}
++
++const severityFromNvim = (s: number): Diagnostic["severity"] =>
++	s === 1 ? "error" : s === 2 ? "warning" : "info";
++
++export interface NvimCompletionItem {
++	label: string;
++	insertText?: string;
++	detail?: string;
++	kind?: number; // LSP CompletionItemKind
++}
++
++export class NvimModePlugin {
++	private client: NvimRpcClient | null = null;
++	private modeBar: HTMLDivElement;
++	private disposed = false;
++	private currentPath: string | null = null;
++	private connected: Promise<void>;
++
++	constructor(private view: EditorView) {
++		this.modeBar = document.createElement("div");
++		this.modeBar.className = "nvim-mode-bar";
++		this.modeBar.textContent = "-- connecting to nvim --";
++		view.dom.prepend(this.modeBar);
++		this.connected = this.connect();
++	}
++
++	private async connect() {
++		try {
++			const { discoveredPort } = await ensureServerRunning(
++				nvimServerDefinition,
++				"nvim-mode",
++			);
++			const client = await connectNvimRpc(nvimServerDefinition, {
++				dynamicPort: discoveredPort,
++			});
++			if (this.disposed) {
++				client.dispose();
++				return;
++			}
++			this.client = client;
++
++			client.onNotification((method, params) => {
++				if (method === "nvim_buf_lines_event") {
++					this.applyBufferLines(params);
++				} else if (method === "nvim-mode:diagnostics") {
++					this.applyDiagnostics(params);
++				}
++			});
++
++			// Starts attached to Neovim's initial empty scratch buffer.
++			// setFilePath() (called from configureLspForFile once the real
++			// file is known) switches this to the actual file via :edit.
++			await this.attachToCurrentBuffer();
++			this.modeBar.textContent = "-- NORMAL --";
++		} catch (err) {
++			this.modeBar.textContent = `nvim connection failed: ${String(err)}`;
++			console.error("[nvim-mode] connect failed", err);
++		}
++	}
++
++	/**
++	 * Switches Neovim's current buffer to the given real filesystem path
++	 * (reachable from inside the Alpine/Termux environment nvim runs in —
++	 * NOT necessarily the same path Acode's WebView sees for the file).
++	 * Re-attaches buffer sync and diagnostics, since :edit moves to a new
++	 * buffer handle.
++	 *
++	 * Known gap: this expects a plain filesystem path. Untitled buffers and
++	 * documents Acode can only reach via a cache copy need the same
++	 * real-path/cache-path resolution builtinAlpine.ts already does for
++	 * other LSP servers (see canUseRealPath/cacheDocumentUri there) — not
++	 * reimplemented here yet.
++	 */
++	async setFilePath(path: string): Promise<void> {
++		if (!this.client || !path || path === this.currentPath) return;
++		this.currentPath = path;
++		await this.connected;
++		if (!this.client) return;
++		await this.client.request("nvim_command", [
++			`edit ${escapeVimCommandArg(path)}`,
++		]);
++		await this.attachToCurrentBuffer();
++	}
++
++	private async attachToCurrentBuffer(): Promise<void> {
++		if (!this.client) return;
++		await this.client.request("nvim_buf_attach", [0, true, {}]);
++
++		// Route Neovim's own diagnostics (from whatever LSP client your
++		// init.lua attaches — Pyright via nvim-lspconfig, etc.) back to us,
++		// instead of running a second, separate LSP client inside Acode.
++		// Re-registered per buffer since `buffer = 0` binds to whichever
++		// buffer is current at creation time, and :edit moves to a new one.
++		await this.client.request("nvim_exec_lua", [
++			`
++			vim.api.nvim_create_autocmd("DiagnosticChanged", {
++			  buffer = 0,
++			  callback = function(args)
++			    vim.rpcnotify(0, "nvim-mode:diagnostics", vim.diagnostic.get(args.buf))
++			  end,
++			})
++			`,
++			[],
++		]);
++
++		this.diagnostics = [];
++		await this.syncCursorAndMode();
++	}
++
++	private diagnostics: Diagnostic[] = [];
++
++	private applyDiagnostics(params: unknown[]) {
++		const raw = (params[0] as NvimDiagnostic[]) || [];
++		const doc = this.view.state.doc;
++		this.diagnostics = raw.map((d) => {
++			const fromLine = Math.min(d.lnum + 1, doc.lines);
++			const toLine = Math.min((d.end_lnum ?? d.lnum) + 1, doc.lines);
++			const from = Math.min(doc.line(fromLine).from + d.col, doc.length);
++			const rawTo = doc.line(toLine).from + (d.end_col ?? d.col + 1);
++			const to = Math.min(Math.max(rawTo, from + 1), doc.length);
++			return {
++				from,
++				to,
++				severity: severityFromNvim(d.severity),
++				message: d.message,
++				source: d.source,
++			};
++		});
++		forceLinting(this.view);
++	}
++
++	getDiagnostics(): Diagnostic[] {
++		return this.diagnostics;
++	}
++
++	/**
++	 * Blocking LSP completion request through Neovim's own client — reuses
++	 * whatever language servers your init.lua already wires up (Pyright,
++	 * etc.) instead of Acode running a second, independent LSP connection.
++	 */
++	async requestCompletion(pos: number): Promise<NvimCompletionItem[]> {
++		if (!this.client) return [];
++		const line = this.view.state.doc.lineAt(pos);
++		const lua = `
++			local params = {
++			  textDocument = { uri = vim.uri_from_bufnr(0) },
++			  position = { line = ${line.number - 1}, character = ${pos - line.from} },
++			}
++			local clients = vim.lsp.get_clients({ bufnr = 0 })
++			if #clients == 0 then return vim.NIL end
++			local ok, result = pcall(function()
++			  return clients[1]:request_sync("textDocument/completion", params, 1000, 0)
++			end)
++			if not ok or not result then return vim.NIL end
++			return result.result or vim.NIL
++		`;
++		try {
++			const result = await this.client.request("nvim_exec_lua", [lua, []]);
++			return normalizeCompletionResult(result);
++		} catch (err) {
++			console.error("[nvim-mode] completion request failed", err);
++			return [];
++		}
++	}
++
++	private applyBufferLines(params: unknown[]) {
++		// nvim_buf_lines_event: [buf, changedtick, firstline, lastline, linedata, more]
++		const [, , firstline, lastline, linedata] = params as [
++			unknown,
++			unknown,
++			number,
++			number,
++			string[],
++			boolean,
++		];
++		const doc = this.view.state.doc;
++		const fromLine = Math.min(firstline + 1, doc.lines);
++		const from = doc.line(fromLine).from;
++		const toLine = lastline === -1 ? doc.lines : Math.min(lastline, doc.lines);
++		const to =
++			lastline === -1 || toLine >= doc.lines
++				? doc.length
++				: doc.line(toLine + 1).from;
++
++		const insert = linedata.join("\n") + (linedata.length ? "\n" : "");
++		this.view.dispatch({ changes: { from, to, insert } });
++	}
++
++	private async syncCursorAndMode() {
++		if (!this.client) return;
++		const [row, col] = (await this.client.request("nvim_win_get_cursor", [
++			0,
++		])) as [number, number];
++		const modeInfo = (await this.client.request("nvim_get_mode", [])) as {
++			mode: string;
++		};
++		this.modeBar.textContent = `-- ${modeLabels[modeInfo.mode] ?? modeInfo.mode.toUpperCase()} --`;
++
++		const line = this.view.state.doc.line(
++			Math.min(row, this.view.state.doc.lines),
++		);
++		const pos = Math.min(line.from + col, line.to);
++		this.view.dispatch({ selection: { anchor: pos } });
++	}
++
++	// Must be synchronous: CodeMirror's keymap `any` handler needs an
++	// immediate boolean, not a Promise (which is always truthy and would
++	// swallow every keystroke regardless of whether nvim recognized it).
++	tryHandleKey(e: KeyboardEvent): boolean {
++		if (!this.client) return false;
++		const key = toNvimKey(e);
++		if (!key) return false;
++		e.preventDefault();
++		void this.client
++			.request("nvim_input", [key])
++			.then(() => this.syncCursorAndMode())
++			.catch((err) => console.error("[nvim-mode] input failed", err));
++		return true;
++	}
++
++	destroy() {
++		this.disposed = true;
++		this.client?.dispose();
++		this.modeBar.remove();
++	}
++}
++
++// :edit splits on unescaped whitespace and treats a few characters
++// specially — escape what a real filesystem path could plausibly contain.
++function escapeVimCommandArg(path: string): string {
++	return path.replace(/([ \t%#\\])/g, "\\$1");
++}
++
++// LSP completion responses come as either a bare CompletionItem[] or a
++// CompletionList { isIncomplete, items }. Normalize to a flat array.
++function normalizeCompletionResult(result: unknown): NvimCompletionItem[] {
++	if (!result) return [];
++	const raw = Array.isArray(result)
++		? result
++		: (result as { items?: unknown[] })?.items;
++	if (!Array.isArray(raw)) return [];
++
++	const items: NvimCompletionItem[] = [];
++	for (const entry of raw) {
++		const i = entry as Record<string, unknown>;
++		if (typeof i.label !== "string") continue;
++		const label: string = i.label;
++		const textEdit = i.textEdit as { newText?: string } | undefined;
++		const insertText: string =
++			typeof i.insertText === "string"
++				? i.insertText
++				: (textEdit?.newText ?? label);
++		items.push({
++			label,
++			insertText,
++			detail: typeof i.detail === "string" ? i.detail : undefined,
++			kind: typeof i.kind === "number" ? i.kind : undefined,
++		});
++	}
++	return items;
++}
++
++let activePlugin: NvimModePlugin | null = null;
++
++export function getActiveNvimPlugin(): NvimModePlugin | null {
++	return activePlugin;
++}
++
++export const nvimModeViewPlugin = ViewPlugin.fromClass(
++	class {
++		plugin: NvimModePlugin;
++		constructor(view: EditorView) {
++			this.plugin = new NvimModePlugin(view);
++			activePlugin = this.plugin;
++		}
++		destroy() {
++			this.plugin.destroy();
++			activePlugin = null;
++		}
++	},
++);
++
++// High precedence so this intercepts keys before CodeMirror's own keymaps
++// (default keymap, closebrackets, etc.) get a chance to run.
++export const nvimModeKeymap = Prec.highest(
++	keymap.of([
++		{
++			any(_view, event) {
++				return activePlugin?.tryHandleKey(event) ?? false;
++			},
++		},
++	]),
++);
++
++export const nvimModeExtension = [nvimModeViewPlugin, nvimModeKeymap];
+diff --git a/src/cm/nvim/nvimServer.ts b/src/cm/nvim/nvimServer.ts
+new file mode 100644
+index 0000000..daa42c5
+--- /dev/null
++++ b/src/cm/nvim/nvimServer.ts
+@@ -0,0 +1,84 @@
++import { defineServer, installers } from "../lsp/providerUtils";
++import { sanitizeDefinition } from "../lsp/serverRegistry";
++import type { LspServerDefinition } from "../lsp/types";
++
++/*
++ * Neovim isn't an LSP server, but Acode's launcher/bridge plumbing (spawn a
++ * binary through the "axs" bridge, expose it over a local WebSocket) is
++ * protocol-agnostic — it's the exact same mechanism pyright/ty/pylsp already
++ * use. We reuse `defineServer` + the registry's own `sanitizeDefinition` to
++ * get a real, fully-normalized LspServerDefinition for free; this is never
++ * registered with the LSP server registry itself.
++ */
++
++// Minimal, well-known lazy.nvim bootstrap + nvim-lspconfig + Pyright +
++// Treesitter (python). This ONLY gets written if no init.lua already
++// exists (see the `test -f` guard below) — if you already have a real
++// config in the Alpine environment, this never touches it, and your own
++// setup is used as-is.
++const BOOTSTRAP_INIT_LUA = `
++local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
++if not vim.loop.fs_stat(lazypath) then
++	vim.fn.system({
++		"git", "clone", "--filter=blob:none",
++		"https://github.com/folke/lazy.nvim.git",
++		"--branch=stable", lazypath,
++	})
++end
++vim.opt.rtp:prepend(lazypath)
++
++require("lazy").setup({
++	{ "neovim/nvim-lspconfig" },
++	{
++		"nvim-treesitter/nvim-treesitter",
++		build = ":TSUpdate",
++		config = function()
++			require("nvim-treesitter.configs").setup({
++				ensure_installed = { "python" },
++				highlight = { enable = true },
++			})
++		end,
++	},
++})
++
++require("lspconfig").pyright.setup({})
++`.trim();
++
++function buildNvimInstallCommand(): string {
++	const heredoc = BOOTSTRAP_INIT_LUA.replace(/'/g, "'\\''");
++	return [
++		// nvim itself, plus git (lazy.nvim bootstrap clones from it) and a
++		// C toolchain (nvim-treesitter's :TSUpdate compiles parsers).
++		"apk add --no-cache neovim git python3 py3-pip build-base",
++		// Pyright — so nvim-lspconfig's default pyright setup finds it on
++		// PATH. Kept as a plain pip install here rather than piggybacking
++		// on Acode's own pyright installer, since that one's lifecycle is
++		// tied to Acode's separate LSP client, which vim mode bypasses.
++		"PIP_BREAK_SYSTEM_PACKAGES=1 pip install --no-cache-dir pyright",
++		'mkdir -p "$HOME/.config/nvim"',
++		// Never overwrite a real, existing config.
++		`if [ ! -f "$HOME/.config/nvim/init.lua" ]; then cat > "$HOME/.config/nvim/init.lua" <<'NVIM_MODE_EOF'\n${heredoc}\nNVIM_MODE_EOF\nfi`,
++	].join(" && \\\n");
++}
++
++export const nvimServerDefinition: LspServerDefinition = sanitizeDefinition(
++	defineServer({
++		id: "nvim-mode",
++		label: "Neovim (vim motions)",
++		languages: ["*"],
++		command: "nvim",
++		args: ["--embed"],
++		checkCommand: "which nvim",
++		installer: installers.shell({
++			executable: "nvim",
++			command: buildNvimInstallCommand(),
++			label: "Neovim (vim motions)",
++		}),
++		transport: {
++			options: { raw: true }, // byte-safe framing — see transport.ts's `raw` option
++		},
++		enabled: false, // gated behind a user-facing "Vim mode" toggle, not autostarted
++	}),
++);
++
++export default nvimServerDefinition;
+diff --git a/src/lib/editorManager.js b/src/lib/editorManager.js
+index 5341cc8..9dd2cb8 100644
+--- a/src/lib/editorManager.js
++++ b/src/lib/editorManager.js
+@@ -52,6 +52,8 @@ import {
+ } from "cm/lsp/diagnostics";
+ import { stopManagedServer } from "cm/lsp/serverLauncher";
+ import createMainEditorExtensions from "cm/mainEditorExtensions";
++import { nvimLspExtensions } from "cm/nvim/nvimLsp";
++import { getActiveNvimPlugin, nvimModeExtension } from "cm/nvim/nvimModePlugin";
+ // CodeMirror mode management
+ import {
+ 	getMode,
+@@ -1395,6 +1397,37 @@ async function EditorManager($header, $body) {
+ 		const pane = getFileLspPane(file);
+ 		if (!pane?.editor || pane.activeFile?.id !== file?.id) return;
+ 		const targetEditor = pane.editor;
++
++		// Vim mode owns diagnostics/completion through Neovim's own LSP
++		// client (whatever nvim-lspconfig attaches in your init.lua) instead
++		// of Acode's separate lspClientManager connection. Skip straight to
++		// the swap — no second LSP client gets started for this file.
++		if (appSettings.value.vimMode) {
++			detachActiveLsp(pane, { invalidate: false });
++			pane.lastLspUri = null;
++			targetEditor.dispatch({
++				effects: lspCompartment.reconfigure(nvimLspExtensions),
++			});
++			file.session = targetEditor.state;
++
++			// file.uri is a file:// URI as Acode's WebView sees it; nvim runs
++			// inside the Alpine/Termux environment, which usually shares the
++			// same filesystem path for real (non-cache, non-untitled) files.
++			// Untitled buffers or cache-only documents aren't handled here —
++			// see builtinAlpine.ts's canUseRealPath/cacheDocumentUri for the
++			// resolution logic this would need to borrow for those cases.
++			const uri = getFileLspUri(file);
++			if (uri?.startsWith("file://")) {
++				const path = decodeURIComponent(uri.replace(/^file:\/\//, ""));
++				void getActiveNvimPlugin()
++					?.setFilePath(path)
++					.catch((err) =>
++						console.error("[nvim-mode] setFilePath failed", err),
++					);
++			}
++			return;
++		}
++
+ 		const metadata = buildLspMetadata(file, targetEditor);
+ 		const token = ++pane.lspRequestToken;
+ 		if (!metadata) {
+@@ -2944,6 +2977,11 @@ async function EditorManager($header, $body) {
+ 			searchExtension: search(),
+ 			// Keep dynamic compartments across state swaps
+ 			optionExtensions: getBaseExtensionsFromOptions(),
++			// Vim motions layer — off by default, same on/off pattern as
++			// useEmmet/colorPreview/etc. Doesn't touch the LSP client below.
++			nvimModeExtension: appSettings.value.vimMode
++				? nvimModeExtension
++				: undefined,
+ 		});
+ 		const exts = [...baseExtensions];
+ 		maybeAttachEmmetCompletions(exts, syntax);
+diff --git a/src/ui/settings/appSettingsComponent.js b/src/ui/settings/appSettingsComponent.js
+index abc1234..def5678 100644
+--- a/src/ui/settings/appSettingsComponent.js
++++ b/src/ui/settings/appSettingsComponent.js
+@@ -1,5 +1,6 @@
+ import { t } from "lib/i18n";
+ import { createSwitch } from "ui/components/switch";
++import { nvimServerDefinition } from "cm/nvim/nvimServer";
+ import { ensureServerRunning, showInstallerDialogIfNeeded } from "cm/lsp/serverLauncher";
+ 
+ export default function createAppSettingsComponent(settings) {
+@@ -150,6 +151,85 @@ export default function createAppSettingsComponent(settings) {
+ 			},
+ 		});
+ 
++		// === Neovim Installation Section ===
++		const $nvimSection = document.createElement("div");
++		$nvimSection.className = "settings-section";
++		
++		const $nvimTitle = document.createElement("h3");
++		$nvimTitle.textContent = t("Neovim Backend");
++		$nvimSection.appendChild($nvimTitle);
++
++		const $nvimDesc = document.createElement("p");
++		$nvimDesc.className = "settings-description";
++		$nvimDesc.textContent = t("Install and manage the Neovim backend for Vim mode. Required for Vim keybindings and Neovim-powered features.");
++		$nvimSection.appendChild($nvimDesc);
++
++		// Status indicator
++		const $statusRow = document.createElement("div");
++		$statusRow.className = "settings-row";
++		
++		const $statusLabel = document.createElement("span");
++		$statusLabel.textContent = t("Status:");
++		
++		const $statusValue = document.createElement("span");
++		$statusValue.id = "nvim-status-indicator";
++		$statusValue.style.fontWeight = "bold";
++		$statusValue.style.marginLeft = "8px";
++		
++		$statusRow.appendChild($statusLabel);
++		$statusRow.appendChild($statusValue);
++		$nvimSection.appendChild($statusRow);
++
++		// Install button
++		const $installBtn = document.createElement("button");
++		$installBtn.id = "nvim-install-btn";
++		$installBtn.className = "btn btn-primary";
++		$installBtn.style.marginTop = "12px";
++		$installBtn.style.width = "100%";
++		$installBtn.textContent = t("Install Neovim Backend");
++		
++		$installBtn.onclick = async () => {
++			$statusValue.textContent = t("Checking...");
++			$statusValue.style.color = "#ffa500";
++			$installBtn.disabled = true;
++
++			try {
++				// Check if already installed
++				const checkCmd = nvimServerDefinition.checkCommand;
++				const axs = window.acode?.axs;
++				
++				if (axs) {
++					const result = await axs.exec(checkCmd).output;
++					if (result && result.trim()) {
++						$statusValue.textContent = t("Already Installed ✓");
++						$statusValue.style.color = "#4caf50";
++						$installBtn.textContent = t("Reinstall Neovim");
++						$installBtn.disabled = false;
++						return;
++					}
++				}
++
++				// Not installed, run installer
++				$statusValue.textContent = t("Installing...");
++				await showInstallerDialogIfNeeded(nvimServerDefinition, "nvim-mode");
++				
++				// Verify installation
++				setTimeout(async () => {
++					if (axs) {
++						const verifyResult = await axs.exec(checkCmd).output;
++						if (verifyResult && verifyResult.trim()) {
++							$statusValue.textContent = t("Installation Complete ✓");
++							$statusValue.style.color = "#4caf50";
++							$installBtn.textContent = t("Reinstall Neovim");
++						} else {
++							$statusValue.textContent = t("Installation Failed ✗");
++							$statusValue.style.color = "#f44336";
++						}
++					}
++					$installBtn.disabled = false;
++				}, 2000);
++				
++			} catch (err) {
++				console.error("Neovim installation failed:", err);
++				$statusValue.textContent = t("Error: ") + err.message;
++				$statusValue.style.color = "#f44336";
++				$installBtn.disabled = false;
++			}
++		};
++
++		$nvimSection.appendChild($installBtn);
++		$container.appendChild($nvimSection);
++
+ 		// Update status on mount
+ 		updateStatus();
+ 	}
++
++	// Check initial status when settings page loads
++	setTimeout(() => {
++		const $statusEl = document.getElementById("nvim-status-indicator");
++		const $installBtn = document.getElementById("nvim-install-btn");
++		if ($statusEl && $installBtn && window.acode?.axs) {
++			window.acode.axs.exec(nvimServerDefinition.checkCommand).output
++				.then(result => {
++					if (result && result.trim()) {
++						$statusEl.textContent = t("Installed ✓");
++						$statusEl.style.color = "#4caf50";
++						$installBtn.textContent = t("Reinstall Neovim");
++					} else {
++						$statusEl.textContent = t("Not Installed");
++						$statusEl.style.color = "#f44336";
++					}
++				})
++				.catch(() => {
++					$statusEl.textContent = t("Not Installed");
++					$statusEl.style.color = "#f44336";
++				});
++		}
++	}, 500);
+ }
