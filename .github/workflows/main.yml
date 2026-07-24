@@ -54,27 +54,27 @@ jobs:
             echo "No patches folder found at main-repo/patches"
           fi
 
-      - name: Build Android APK
-        working-directory: acode
-        run: |
-          npx cordova platform add android --nosave || true
-          npx cordova build android --release --device
-
-      # Step 7: Install Node Dependencies
+      # Step 7: Install Dependencies
       - name: Install Dependencies
         working-directory: acode
         run: npm ci || npm install
-        
 
-      # Step 8: Build Acode Web Assets
+      # Step 8: Initialize Cordova Android Platform (moved before build script)
+      - name: Add Cordova Android Platform
+        working-directory: acode
+        run: npx cordova platform add android --nosave || true
+
+      # Step 9: Build Acode Web Assets & Trigger Build Script
       - name: Build Web Assets
         working-directory: acode
         run: npm run build
 
-      # Step 9: Add Android Platform & Build APK via Cordova
-      
+      # Step 10: Compile Android APK via Cordova
+      - name: Build Android APK
+        working-directory: acode
+        run: npx cordova build android --release --device
 
-      # Step 10: Upload Generated APK Artifact
+      # Step 11: Upload Generated APK Artifact
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
