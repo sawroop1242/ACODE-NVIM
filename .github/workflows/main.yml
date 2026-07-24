@@ -36,9 +36,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 22
           cache: 'npm'
           cache-dependency-path: acode/package-lock.json
+
+      
+
 
       # Step 6: Apply patch files from main-repo onto Acode
       
@@ -59,10 +62,13 @@ jobs:
           fi
 
       # Step 7: Install Node dependencies
-      - name: Install npm Dependencies
-        run: |
-          cd acode
-          npm install
+      
+      - name: Install Dependencies
+        run: npm ci      
+        
+
+      - name: Add Cordova Android Platform
+        run: npx cordova platform add android
 
       # Step 8: Build Acode Web Assets
       - name: Build Web Assets
