@@ -3,14 +3,14 @@ name: Build Acode APK with Patches
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build-apk:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Check out your current repository (where your .patch files live)
+      # Step 1: Check out current repository (contains patches/)
       - name: Checkout Current Repository
         uses: actions/checkout@v4
         with:
@@ -21,14 +21,14 @@ jobs:
         run: |
           git clone https://github.com/deadlyjack/Acode.git acode
 
-      # Step 3: Set up Java JDK 17 (Required by Android Gradle/Cordova build)
+      # Step 3: Set up Java JDK 17
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # Step 4: Set up Android SDK Tools
+      # Step 4: Set up Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
@@ -40,12 +40,6 @@ jobs:
           cache: 'npm'
           cache-dependency-path: acode/package-lock.json
 
-      
-
-
-      # Step 6: Apply patch files from main-repo onto Acode
-      
-
       # Step 6: Apply patch files from main-repo onto Acode
       - name: Apply Patch Files
         run: |
@@ -54,39 +48,33 @@ jobs:
             for patch in ../main-repo/patches/*.patch; do
               [ -e "$patch" ] || continue
               echo "Applying patch: $patch..."
-              # --forward ignores patches that are already applied
               git apply --forward "$patch" || echo "Skipped $patch (already applied or conflict)"
             done
           else
             echo "No patches folder found at main-repo/patches"
           fi
 
-      # Step 7: Install Node dependencies
-      
+      # Step 7: Install Node Dependencies
       - name: Install Dependencies
-        run: npm install     
-        
-
-      - name: Add Cordova Android Platform
-        run: npx cordova platform add android
+        working-directory: acode
+        run: npm ci || npm install
 
       # Step 8: Build Acode Web Assets
       - name: Build Web Assets
-        run: |
-          cd acode
-          npm run build
+        working-directory: acode
+        run: npm run build
 
       # Step 9: Add Android Platform & Build APK via Cordova
       - name: Build Android APK
+        working-directory: acode
         run: |
-          cd acode
-          # Ensure Cordova is available
           npx cordova platform add android --nosave || true
           npx cordova build android --release --device
 
-      # Step 10: Upload the generated APK file as a Github Action Artifact
+      # Step 10: Upload Generated APK Artifact
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: acode-release-apk
-          path: acode/platforms/android/app/build/outputs/apk/release/*.apk
+          name: acode-apk
+          path: acode/platforms/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
